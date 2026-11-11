@@ -118,8 +118,10 @@ function Send-SecurityAlert {
         $tempAlertFile = Join-Path $env:TEMP "agy-security-alert.txt"
         [System.IO.File]::WriteAllText($tempAlertFile, $alertText, $utf8NoBom)
 
-        # 2. Append to persistent security log in ~/.gemini/security-alerts.log
-        [System.IO.File]::AppendAllText($logFile, $alertText, $utf8NoBom)
+        # 2. Append compact single-line entry to persistent security log in ~/.gemini/security-alerts.log
+        $cleanTargetOneLine = ($TargetInfo -replace '[\r\n]+', ' ').Trim()
+        $logLine = "[$timestamp] [$($Decision.ToUpperInvariant())] [$RuleName] tool=$tool project=`"$projectFolder`" conv=$convId target=`"$cleanTargetOneLine`" reason=`"$Reason`"`r`n"
+        [System.IO.File]::AppendAllText($logFile, $logLine, $utf8NoBom)
 
         # 3. Write a clean batch launcher and spawn via WMI Win32_Process
         $tempBatFile = Join-Path $env:TEMP "agy-security-alert.bat"
