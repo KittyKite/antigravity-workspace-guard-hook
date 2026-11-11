@@ -99,17 +99,18 @@ function Send-SecurityAlert {
             ""
         )
         $alertText = $alertLines -join "`r`n"
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
         # 1. Write to temp alert file (used by CMD window to prevent any command injection)
         $tempAlertFile = Join-Path $env:TEMP "agy-security-alert.txt"
-        Set-Content -Path $tempAlertFile -Value $alertText -Encoding UTF8 -Force
+        [System.IO.File]::WriteAllText($tempAlertFile, $alertText, $utf8NoBom)
 
         # 2. Append to persistent security log in ~/.gemini/security-alerts.log
         $logFile = Join-Path $geminiRoot "security-alerts.log"
-        Add-Content -Path $logFile -Value $alertText -Encoding UTF8 -Force
+        [System.IO.File]::AppendAllText($logFile, $alertText, $utf8NoBom)
 
         # 3. Pop up a visible CMD console window asynchronously via conhost.exe
-        $cmdArgs = 'cmd.exe /c "color ' + $colorCode + ' & mode con: cols=80 lines=25 & title [ANTIGRAVITY SECURITY ALERT: ' + $RuleName + '] & type ""' + $tempAlertFile + '"" & pause"'
+        $cmdArgs = 'cmd.exe /c "color ' + $colorCode + ' & mode con: cols=85 lines=25 & title [ANTIGRAVITY SECURITY ALERT: ' + $RuleName + '] & type ""' + $tempAlertFile + '"" & pause"'
         Start-Process -FilePath "conhost.exe" -ArgumentList $cmdArgs -ErrorAction SilentlyContinue
     } catch {
         # Never let alert UI failure prevent blocking the tool call
@@ -279,7 +280,9 @@ if ($tool -eq "run_command" -and $args.PSObject.Properties["CommandLine"]) {
 @{ decision = "allow" } | ConvertTo-Json -Compress
 '@
 
-Set-Content -Path $hooksFile -Value $hooksJson -Encoding UTF8
-Set-Content -Path $guardFile -Value $guardScript -Encoding UTF8
+# IMPORTANT: Write UTF-8 WITHOUT BOM so Antigravity's JSON parser accepts hooks.json!
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($hooksFile, $hooksJson, $utf8NoBom)
+[System.IO.File]::WriteAllText($guardFile, $guardScript, $utf8NoBom)
 
-Write-Host "Installed Hardened Antigravity Workspace Guard Hook (with CMD Alert Popup) to: $configDir" -ForegroundColor Green
+Write-Host "Installed Hardened Antigravity Workspace Guard Hook (UTF-8 No BOM + CMD Alert Popup) to: $configDir" -ForegroundColor Green
