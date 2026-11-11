@@ -1,4 +1,4 @@
-# Self-contained installer for the Antigravity Global Workspace Guard Hook (Hardened + Live CMD Alert Popup)
+# Self-contained installer for the Antigravity Global Workspace Guard Hook (Hardened + Persistent CMD Alert Window)
 # Run this script in PowerShell on any Windows computer to install the hook globally.
 
 $configDir  = Join-Path $env:USERPROFILE ".gemini\config"
@@ -77,7 +77,7 @@ function Send-SecurityAlert {
         $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
         $activeWs  = if ($payload.workspacePaths -and $payload.workspacePaths.Count -gt 0) { ($payload.workspacePaths -join ", ") } else { "(No Active Workspace - Scratch Only)" }
         $convId    = "$($payload.conversationId)"
-        $colorCode = if ($Decision -eq "deny") { "4F" } else { "6F" } # 4F = Red bg/White text, 6F = Yellow-Brown bg/White text
+        $colorCode = if ($Decision -eq "deny") { "4F" } else { "6F" } # 4F = Red bg/White text, 6F = Amber bg/White text
 
         $alertLines = @(
             "=========================================================================="
@@ -101,7 +101,7 @@ function Send-SecurityAlert {
         $alertText = $alertLines -join "`r`n"
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
-        # 1. Write to temp alert file (used by CMD window to prevent any command injection)
+        # 1. Write to temp alert file (read by type command so untrusted strings are never executed)
         $tempAlertFile = Join-Path $env:TEMP "agy-security-alert.txt"
         [System.IO.File]::WriteAllText($tempAlertFile, $alertText, $utf8NoBom)
 
@@ -109,9 +109,23 @@ function Send-SecurityAlert {
         $logFile = Join-Path $geminiRoot "security-alerts.log"
         [System.IO.File]::AppendAllText($logFile, $alertText, $utf8NoBom)
 
-        # 3. Pop up a visible CMD console window asynchronously via conhost.exe
-        $cmdArgs = 'cmd.exe /c "color ' + $colorCode + ' & mode con: cols=85 lines=25 & title [ANTIGRAVITY SECURITY ALERT: ' + $RuleName + '] & type ""' + $tempAlertFile + '"" & pause"'
-        Start-Process -FilePath "conhost.exe" -ArgumentList $cmdArgs -ErrorAction SilentlyContinue
+        # 3. Write a clean batch launcher and spawn via WMI Win32_Process so it runs outside
+        #    Antigravity's hook Job Object (won't get killed when the hook exits) and reads < CON
+        $tempBatFile = Join-Path $env:TEMP "agy-security-alert.bat"
+        $batLines = @(
+            "@echo off"
+            "color $colorCode"
+            "mode con: cols=92 lines=28"
+            "title [ANTIGRAVITY SECURITY ALERT: $RuleName]"
+            "cls"
+            "type `"$tempAlertFile`""
+            "echo."
+            "pause < CON"
+        )
+        [System.IO.File]::WriteAllText($tempBatFile, ($batLines -join "`r`n"), $utf8NoBom)
+
+        $wmi = [wmiclass]"Win32_Process"
+        $wmi.Create("cmd.exe /c `"$tempBatFile`"") | Out-Null
     } catch {
         # Never let alert UI failure prevent blocking the tool call
     }
@@ -285,4 +299,4 @@ $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText($hooksFile, $hooksJson, $utf8NoBom)
 [System.IO.File]::WriteAllText($guardFile, $guardScript, $utf8NoBom)
 
-Write-Host "Installed Hardened Antigravity Workspace Guard Hook (UTF-8 No BOM + CMD Alert Popup) to: $configDir" -ForegroundColor Green
+Write-Host "Installed Hardened Antigravity Workspace Guard Hook (UTF-8 No BOM + Persistent CMD Alert Window) to: $configDir" -ForegroundColor Green
