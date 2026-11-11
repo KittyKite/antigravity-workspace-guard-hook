@@ -47,6 +47,7 @@ $tool = "$($payload.toolCall.name)".ToLowerInvariant()
 $args = $payload.toolCall.args
 
 $geminiRoot = Join-Path $env:USERPROFILE ".gemini"
+$scratchDir = Join-Path $geminiRoot "antigravity\scratch"
 
 $readWritePaths = @()
 if ($payload.workspacePaths) {
@@ -55,7 +56,7 @@ if ($payload.workspacePaths) {
 if ($payload.artifactDirectoryPath) {
     $readWritePaths += "$($payload.artifactDirectoryPath)"
 }
-$readWritePaths += (Join-Path $geminiRoot "antigravity\scratch")
+$readWritePaths += $scratchDir
 
 $readOnlyPaths = @(
     (Join-Path $geminiRoot "antigravity\builtin"),
@@ -75,27 +76,39 @@ function Send-SecurityAlert {
     )
     try {
         $timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-        $activeWs  = if ($payload.workspacePaths -and $payload.workspacePaths.Count -gt 0) { ($payload.workspacePaths -join ", ") } else { "(No Active Workspace - Scratch Only)" }
+        $projectFolder = if ($payload.workspacePaths -and $payload.workspacePaths.Count -gt 0) {
+            ($payload.workspacePaths -join ", ")
+        } else {
+            "$scratchDir (Default Scratch - No Project Workspace Selected)"
+        }
         $convId    = "$($payload.conversationId)"
-        $colorCode = if ($Decision -eq "deny") { "4F" } else { "6F" } # 4F = Red bg/White text, 6F = Amber bg/White text
+        $logFile   = Join-Path $geminiRoot "security-alerts.log"
+
+        # 40 = Red background (4) + Black text (0) for DENY
+        # 60 = Amber background (6) + Black text (0) for FORCE_ASK warning
+        $colorCode = if ($Decision -eq "deny") { "40" } else { "60" }
+
+        $eqBar   = "=" * 136
+        $dashBar = "-" * 136
 
         $alertLines = @(
-            "=========================================================================="
-            "               ANTIGRAVITY SECURITY GUARD - RULE TRIPPED                  "
-            "=========================================================================="
-            " Time           : $timestamp"
-            " Action Taken   : $($Decision.ToUpperInvariant())"
-            " Rule Tripped   : $RuleName"
-            " Tool Called    : $tool"
-            " Active Project : $activeWs"
-            " Conversation   : $convId"
-            "--------------------------------------------------------------------------"
+            $eqBar
+            "                                            ANTIGRAVITY SECURITY GUARD - RULE TRIPPED                                                   "
+            $eqBar
+            " Time            : $timestamp"
+            " Action Taken    : $($Decision.ToUpperInvariant())"
+            " Rule Tripped    : $RuleName"
+            " Tool Called     : $tool"
+            " Project Folder  : $projectFolder"
+            " Security Log    : $logFile"
+            " Conversation ID : $convId"
+            $dashBar
             " Target / Command:"
             " $TargetInfo"
             ""
             " Reason:"
             " $Reason"
-            "=========================================================================="
+            $eqBar
             ""
         )
         $alertText = $alertLines -join "`r`n"
@@ -106,16 +119,14 @@ function Send-SecurityAlert {
         [System.IO.File]::WriteAllText($tempAlertFile, $alertText, $utf8NoBom)
 
         # 2. Append to persistent security log in ~/.gemini/security-alerts.log
-        $logFile = Join-Path $geminiRoot "security-alerts.log"
         [System.IO.File]::AppendAllText($logFile, $alertText, $utf8NoBom)
 
-        # 3. Write a clean batch launcher and spawn via WMI Win32_Process so it runs outside
-        #    Antigravity's hook Job Object (won't get killed when the hook exits) and reads < CON
+        # 3. Write a clean batch launcher and spawn via WMI Win32_Process
         $tempBatFile = Join-Path $env:TEMP "agy-security-alert.bat"
         $batLines = @(
             "@echo off"
             "color $colorCode"
-            "mode con: cols=92 lines=28"
+            "mode con: cols=138 lines=30"
             "title [ANTIGRAVITY SECURITY ALERT: $RuleName]"
             "cls"
             "type `"$tempAlertFile`""
@@ -299,4 +310,4 @@ $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText($hooksFile, $hooksJson, $utf8NoBom)
 [System.IO.File]::WriteAllText($guardFile, $guardScript, $utf8NoBom)
 
-Write-Host "Installed Hardened Antigravity Workspace Guard Hook (UTF-8 No BOM + Persistent CMD Alert Window) to: $configDir" -ForegroundColor Green
+Write-Host "Installed Hardened Antigravity Workspace Guard Hook to: $configDir" -ForegroundColor Green
