@@ -1,0 +1,2 @@
+# antigravity-workspace-guard-hook
+
