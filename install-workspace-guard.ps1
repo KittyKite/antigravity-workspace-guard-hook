@@ -1,4 +1,4 @@
-# Self-contained installer for the Antigravity Global Workspace Guard Hook (Hardened + Persistent CMD Alert Window)
+# Self-contained installer for the Antigravity Global Workspace Guard Hook (Hardened + PostToolUse/PreInvocation Runtime Stdout Scanner)
 # Run this script in PowerShell on any Windows computer to install the hook globally.
 
 $configDir  = Join-Path $env:USERPROFILE ".gemini\config"
@@ -18,10 +18,29 @@ $hooksJson = @'
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/workspace-guard.ps1",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/workspace-guard.ps1 -HookEvent PreToolUse",
             "timeout": 5
           }
         ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/workspace-guard.ps1 -HookEvent PostToolUse",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/workspace-guard.ps1 -HookEvent PreInvocation",
+        "timeout": 5
       }
     ]
   }
@@ -29,22 +48,34 @@ $hooksJson = @'
 '@
 
 $guardScript = @'
+param(
+    [string]$HookEvent = "PreToolUse"
+)
+
 $ErrorActionPreference = "Stop"
 
 try {
     $rawInput = [Console]::In.ReadToEnd()
     if ([string]::IsNullOrWhiteSpace($rawInput)) {
-        @{ decision = "allow" } | ConvertTo-Json -Compress
+        if ($HookEvent -eq "PostToolUse" -or $HookEvent -eq "PreInvocation") {
+            Write-Output "{}"
+        } else {
+            @{ decision = "allow" } | ConvertTo-Json -Compress
+        }
         exit 0
     }
     $payload = $rawInput | ConvertFrom-Json
 } catch {
-    @{ decision = "allow" } | ConvertTo-Json -Compress
+    if ($HookEvent -eq "PostToolUse" -or $HookEvent -eq "PreInvocation") {
+        Write-Output "{}"
+    } else {
+        @{ decision = "allow" } | ConvertTo-Json -Compress
+    }
     exit 0
 }
 
-$tool = "$($payload.toolCall.name)".ToLowerInvariant()
-$args = $payload.toolCall.args
+$tool = if ($payload.PSObject.Properties["toolCall"] -and $payload.toolCall) { "$($payload.toolCall.name)".ToLowerInvariant() } else { "runtime_stdout" }
+$args = if ($payload.PSObject.Properties["toolCall"] -and $payload.toolCall) { $payload.toolCall.args } else { $null }
 
 $geminiRoot = Join-Path $env:USERPROFILE ".gemini"
 $scratchDir = Join-Path $geminiRoot "antigravity\scratch"
@@ -153,6 +184,80 @@ function Stop-WithAlert {
     )
     Send-SecurityAlert -Decision $Decision -RuleName $RuleName -TargetInfo $TargetInfo -Reason $Reason
     @{ decision = $Decision; reason = "[$RuleName] $Reason" } | ConvertTo-Json -Compress
+    exit 0
+}
+
+# =========================================================================================
+# POST-TOOL-USE & PRE-INVOCATION: Scan Runtime Command Output (stdout) for Prompt Injection
+# =========================================================================================
+if ($HookEvent -eq "PostToolUse" -or $HookEvent -eq "PreInvocation") {
+    try {
+        if ($payload.transcriptPath) {
+            $tDir  = Split-Path "$($payload.transcriptPath)" -Parent
+            $tFull = Join-Path $tDir "transcript_full.jsonl"
+            $tFile = if (Test-Path -LiteralPath $tFull) { $tFull } elseif (Test-Path -LiteralPath "$($payload.transcriptPath)") { "$($payload.transcriptPath)" } else { $null }
+
+            if ($tFile) {
+                $lastLines = Get-Content -LiteralPath $tFile -Tail 2 -ErrorAction SilentlyContinue
+                foreach ($line in $lastLines) {
+                    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                    $stepObj = $line | ConvertFrom-Json -ErrorAction SilentlyContinue
+                    if ($null -eq $stepObj -or $stepObj.type -ne "GENERIC" -or [string]::IsNullOrWhiteSpace("$($stepObj.content)")) { continue }
+
+                    # In PreInvocation, only inspect if the very last step in the transcript is a tool result
+                    if ($HookEvent -eq "PreInvocation" -and $line -ne $lastLines[-1]) { continue }
+
+                    $contentStr = "$($stepObj.content)"
+                    if ($contentStr -match 'Command output:\r?\n([\s\S]*)$') {
+                        $cmdStdout = $Matches[1]
+                        $hitRule   = $null
+                        $hitReason = $null
+
+                        if ($cmdStdout -match '[\u202A-\u202E\u2066-\u2069]|\uDB40[\uDC00-\uDC7F]') {
+                            $hitRule   = "Runtime-Stdout-Unicode-Injection"
+                            $hitReason = "Command output dynamically generated invisible Unicode tag/override characters in stdout!"
+                        } elseif ($cmdStdout -match '(</USER_REQUEST>|<SYSTEM_MESSAGE>|IGNORE ALL PREVIOUS INSTRUCTIONS|DISREGARD ALL PREVIOUS INSTRUCTIONS)') {
+                            $hitRule   = "Runtime-Stdout-Prompt-Injection"
+                            $hitReason = "Command output dynamically generated prompt injection boundary markers in stdout!"
+                        }
+
+                        if ($hitRule) {
+                            # Deduplicate popup across PostToolUse + PreInvocation for the same step_index
+                            $dedupFile = Join-Path $env:TEMP "agy-last-stdout-alert.txt"
+                            $dedupKey  = "$($payload.conversationId):$($stepObj.step_index)"
+                            $lastKey   = if (Test-Path -LiteralPath $dedupFile) { (Get-Content -LiteralPath $dedupFile -Raw -ErrorAction SilentlyContinue).Trim() } else { "" }
+
+                            if ($lastKey -ne $dedupKey) {
+                                Set-Content -LiteralPath $dedupFile -Value $dedupKey -NoNewline -Force
+                                $preview = ($cmdStdout.Trim() -replace '[\r\n]+', ' ')
+                                if ($preview.Length -gt 200) { $preview = $preview.Substring(0, 200) + "..." }
+                                $tool = "run_command (stdout)"
+                                Send-SecurityAlert -Decision "deny" -RuleName $hitRule -TargetInfo "stdout: $preview" -Reason $hitReason
+                            }
+
+                            if ($HookEvent -eq "PreInvocation") {
+                                @{
+                                    injectSteps = @(
+                                        @{
+                                            errorMessage = @{
+                                                userMessage = "[$hitRule] Execution terminated before calling model: $hitReason"
+                                            }
+                                        }
+                                    )
+                                    terminationBehavior = "terminate"
+                                } | ConvertTo-Json -Depth 6 -Compress
+                                exit 0
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } catch {
+        # Ignore transcript read errors
+    }
+
+    Write-Output "{}"
     exit 0
 }
 
@@ -312,4 +417,4 @@ $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText($hooksFile, $hooksJson, $utf8NoBom)
 [System.IO.File]::WriteAllText($guardFile, $guardScript, $utf8NoBom)
 
-Write-Host "Installed Hardened Antigravity Workspace Guard Hook to: $configDir" -ForegroundColor Green
+Write-Host "Installed Hardened Antigravity Workspace Guard Hook (PreToolUse + PostToolUse + PreInvocation) to: $configDir" -ForegroundColor Green
