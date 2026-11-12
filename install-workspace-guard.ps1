@@ -388,8 +388,8 @@ function Test-SensitiveDirectory([string]$pathStr) {
         # 1. Drive roots (C:, D:, E:, etc.)
         if ($resolved -match '^[A-Za-z]:$') { return $true }
 
-        # 2. Windows system & program folders on any drive
-        if ($resolved -match '(?i)^[A-Za-z]:\\(Windows|Program Files|Program Files \(x86\)|ProgramData|Recovery|\$Recycle\.Bin|System Volume Information|PerfLogs|MSOCache|boot|efi)(\\|$)') {
+        # 2. Windows system & program folders on any drive (including 8.3 short names PROGRA~1 / PROGRA~2)
+        if ($resolved -match '(?i)^[A-Za-z]:\\(Windows|Program Files|Program Files \(x86\)|Progra~[12]|ProgramData|Recovery|\$Recycle\.Bin|System Volume Information|PerfLogs|MSOCache|boot|efi)(\\|$)') {
             return $true
         }
 
@@ -504,10 +504,13 @@ if ($tool -eq "run_command" -and $args.PSObject.Properties["CommandLine"]) {
         Stop-WithAlert -Decision "force_ask" -RuleName "Sensitive-Working-Directory" -TargetInfo $cmd -Reason "No project workspace is open (terminal CWD defaults to AppData\Local\Programs\antigravity inside your user folder)."
     }
 
-    # 3a. Check any explicit drive paths referenced in the command line (skip http:// or https://)
-    $driveMatches = [regex]::Matches($cmd, '(?<![A-Za-z0-9_])([A-Za-z]:[/\\][^\s"''`;|&><)*?]*)')
+    # 3a. Check any explicit drive paths referenced in the command line (handles double-quoted, single-quoted, and unquoted paths)
+    $drivePattern = '"([A-Za-z]:[/\\][^"<>|*?\r\n]*)"|''([A-Za-z]:[/\\][^''<>|*?\r\n]*)''|(?<![A-Za-z0-9_"''''])([A-Za-z]:[/\\][^\s"''`;|&><*?)]*)'
+    $driveMatches = [regex]::Matches($cmd, $drivePattern)
     foreach ($m in $driveMatches) {
-        $refPath = $m.Groups[1].Value
+        $refPath = if ($m.Groups[1].Success) { $m.Groups[1].Value }
+                   elseif ($m.Groups[2].Success) { $m.Groups[2].Value }
+                   else { $m.Groups[3].Value }
         if (Test-PathUnder $refPath @((Join-Path $geminiRoot "config"))) {
             Stop-WithAlert -Decision "force_ask" -RuleName "Gemini-Config-Command" -TargetInfo $cmd -Reason "Command references .gemini/config ($refPath)"
         }
