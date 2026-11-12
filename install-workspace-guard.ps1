@@ -18,7 +18,7 @@ $hooksJson = @'
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/workspace-guard.ps1 -HookEvent PreToolUse",
+            "command": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/workspace-guard.ps1 -HookEvent PreToolUse",
             "timeout": 5
           }
         ]
@@ -30,7 +30,7 @@ $hooksJson = @'
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/workspace-guard.ps1 -HookEvent PostToolUse",
+            "command": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/workspace-guard.ps1 -HookEvent PostToolUse",
             "timeout": 5
           }
         ]
@@ -39,7 +39,7 @@ $hooksJson = @'
     "PreInvocation": [
       {
         "type": "command",
-        "command": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/workspace-guard.ps1 -HookEvent PreInvocation",
+        "command": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/workspace-guard.ps1 -HookEvent PreInvocation",
         "timeout": 5
       }
     ]
@@ -81,8 +81,21 @@ $geminiRoot = Join-Path $env:USERPROFILE ".gemini"
 $scratchDir = Join-Path $geminiRoot "antigravity\scratch"
 
 $readWritePaths = @()
+$sensitiveWorkspaces = @()
 if ($payload.workspacePaths) {
-    $readWritePaths += @($payload.workspacePaths)
+    foreach ($ws in @($payload.workspacePaths)) {
+        $wsClean = "$ws".Trim('"', "'", ' ')
+        if ([string]::IsNullOrWhiteSpace($wsClean)) { continue }
+        $wsResolved = [System.IO.Path]::GetFullPath($wsClean).TrimEnd('\', '/')
+        if ($wsResolved -match '^[A-Za-z]:$' -or
+            $wsResolved -match '(?i)^[A-Za-z]:\\(Windows|Program Files|Program Files \(x86\)|ProgramData|Recovery|\$Recycle\.Bin|System Volume Information|PerfLogs|MSOCache|boot|efi)(\\|$)' -or
+            $wsResolved -match '(?i)^[A-Za-z]:\\Users(\\|\\[^\\]+)?$' -or
+            $wsResolved -match '(?i)^[A-Za-z]:\\Users\\[^\\]+\\(AppData|Application Data|Local Settings|Desktop|Documents|My Documents|Downloads|Pictures|Music|Videos|Favorites|OneDrive|Dropbox|Google Drive|iCloudDrive|Saved Games|Contacts|Links|Searches|\.ssh|\.aws|\.azure|\.kube|\.gnupg|\.docker|\.config|\.gemini)(\\|$)') {
+            $sensitiveWorkspaces += $wsResolved
+        } else {
+            $readWritePaths += $wsResolved
+        }
+    }
 }
 if ($payload.artifactDirectoryPath) {
     $readWritePaths += "$($payload.artifactDirectoryPath)"
@@ -169,7 +182,8 @@ function Send-SecurityAlert {
         [System.IO.File]::WriteAllText($tempBatFile, ($batLines -join "`r`n"), $utf8NoBom)
 
         $wmi = [wmiclass]"Win32_Process"
-        $wmi.Create("cmd.exe /c `"$tempBatFile`"") | Out-Null
+        $sysCmd = Join-Path $env:SystemRoot "System32\cmd.exe"
+        $wmi.Create("`"$sysCmd`" /c `"$tempBatFile`"") | Out-Null
     } catch {
         # Never let alert UI failure prevent blocking the tool call
     }
@@ -294,10 +308,110 @@ function Test-SecretFile([string]$pathStr) {
 function Test-TrojanWriteTarget([string]$pathStr) {
     if ([string]::IsNullOrWhiteSpace($pathStr)) { return $false }
     $norm = $pathStr.Trim('"', "'", ' ').Replace('/', '\')
-    if ($norm -match '(^|\\)(\.agents|\.agent|_agents|_agent|\.git\\hooks|\.git\\config|\.vscode\\tasks\.json|\.vscode\\launch\.json|GEMINI\.md|AGENTS\.md|CLAUDE\.md|\.cursorrules)(\\|$)') {
+
+    # Always block IDE auto-run configs and git hooks/config
+    if ($norm -match '(?i)(^|\\)(\.git\\hooks|\.git\\config|\.vscode\\tasks\.json|\.vscode\\launch\.json)(\\|$)') {
         return $true
     }
+
+    # Inside project .agents / .agent folders: allow .md files (rules, skills, workflows),
+    # but block hooks.json, mcp_config.json, plugins.json, skills.json, and executable scripts!
+    if ($norm -match '(?i)(^|\\)(\.agents|\.agent|_agents|_agent)(\\|$)') {
+        if ($norm -match '(?i)\.md$') {
+            return $false
+        }
+        return $true
+    }
+
     return $false
+}
+
+function Test-GlobalCustomizationCollision([string]$pathStr, [string]$newContent) {
+    if ([string]::IsNullOrWhiteSpace($pathStr)) { return $false }
+    $norm = $pathStr.Trim('"', "'", ' ').Replace('/', '\')
+    if ($norm -notmatch '(?i)\.md$') { return $false }
+
+    $leafName = [System.IO.Path]::GetFileName($norm)
+
+    # 1. If writing root GEMINI.md or AGENTS.md, check if a global one exists in ~/.gemini/config/
+    if ($leafName -match '(?i)^(GEMINI|AGENTS)\.md$') {
+        $globalRule = Join-Path $geminiRoot "config\$leafName"
+        if (Test-Path -LiteralPath $globalRule) { return $true }
+    }
+
+    # 2. If writing inside .agents/rules/<name>.md, check if ~/.gemini/config/rules/<name>.md exists
+    if ($norm -match '(?i)(^|\\)(\.agents|\.agent|_agents|_agent)\\rules\\([^\\]+\.md)$') {
+        $ruleFile = $Matches[3]
+        $globalRuleFile = Join-Path $geminiRoot "config\rules\$ruleFile"
+        if (Test-Path -LiteralPath $globalRuleFile) { return $true }
+    }
+
+    # 3. Collect all protected Global & Built-in skill names
+    $protectedNames = @(
+        "agy-customizations", "antigravity-guide", "antigravity_guide", "automation",
+        "generative_ui", "migrate-agent-settings", "migrate-workflows", "plugin",
+        "swarm", "native_swarm", "swarm_monitor", "ui-plugin-navigation"
+    )
+    foreach ($skillRoot in @((Join-Path $geminiRoot "config\skills"), (Join-Path $geminiRoot "antigravity\builtin\skills"))) {
+        if (Test-Path -LiteralPath $skillRoot) {
+            Get-ChildItem -LiteralPath $skillRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                $protectedNames += $_.Name.ToLowerInvariant()
+            }
+        }
+    }
+
+    # Check if .agents/skills/<folder>/SKILL.md folder name collides
+    if ($norm -match '(?i)(^|\\)(\.agents|\.agent|_agents|_agent)\\skills\\([^\\]+)(\\|$)') {
+        $skillFolder = $Matches[3].ToLowerInvariant()
+        if ($skillFolder -in $protectedNames) { return $true }
+    }
+
+    # Check if YAML frontmatter 'name:' inside the new content collides with any protected skill/rule name
+    if (-not [string]::IsNullOrWhiteSpace($newContent) -and $newContent -match '(?m)^name:\s*[''"]?([A-Za-z0-9_-]+)[''"]?\s*$') {
+        $fmName = $Matches[1].ToLowerInvariant()
+        if ($fmName -in $protectedNames) { return $true }
+    }
+
+    return $false
+}
+
+function Test-SensitiveDirectory([string]$pathStr) {
+    if ([string]::IsNullOrWhiteSpace($pathStr)) { return $false }
+    try {
+        $clean = $pathStr.Trim('"', "'", ' ')
+        $resolved = [System.IO.Path]::GetFullPath($clean).TrimEnd('\', '/')
+
+        # Allow internal Antigravity scratch/brain/builtin/plugins folders
+        $allowedInternal = @($scratchDir, "$($payload.artifactDirectoryPath)") + $readOnlyPaths | Where-Object { $_ }
+        if (Test-PathUnder $resolved $allowedInternal) { return $false }
+
+        # 1. Drive roots (C:, D:, E:, etc.)
+        if ($resolved -match '^[A-Za-z]:$') { return $true }
+
+        # 2. Windows system & program folders on any drive
+        if ($resolved -match '(?i)^[A-Za-z]:\\(Windows|Program Files|Program Files \(x86\)|ProgramData|Recovery|\$Recycle\.Bin|System Volume Information|PerfLogs|MSOCache|boot|efi)(\\|$)') {
+            return $true
+        }
+
+        # 3. Users root (C:\Users) or any User Profile root directly (C:\Users\<any_user>)
+        if ($resolved -match '(?i)^[A-Za-z]:\\Users(\\|\\[^\\]+)?$') {
+            return $true
+        }
+
+        # 4. Protected folders inside ANY user profile (AppData, Desktop, Documents, Downloads, .ssh, .gemini, etc.)
+        if ($resolved -match '(?i)^[A-Za-z]:\\Users\\[^\\]+\\(AppData|Application Data|Local Settings|Desktop|Documents|My Documents|Downloads|Pictures|Music|Videos|Favorites|OneDrive|Dropbox|Google Drive|iCloudDrive|Saved Games|Contacts|Links|Searches|\.ssh|\.aws|\.azure|\.kube|\.gnupg|\.docker|\.config|\.gemini|NTUSER.*)(\\|$)') {
+            return $true
+        }
+    } catch {
+        return $false
+    }
+    return $false
+}
+
+# Block immediately if the user accidentally opened a sensitive system/user folder or drive root as the workspace
+if ($sensitiveWorkspaces.Count -gt 0) {
+    $badWs = $sensitiveWorkspaces -join ", "
+    Stop-WithAlert -Decision "deny" -RuleName "Sensitive-Workspace-Root" -TargetInfo $badWs -Reason "Active workspace is set to a protected drive root, Windows system folder, or user folder ($badWs)."
 }
 
 # Extract target file/directory path from tool args if present
@@ -311,6 +425,10 @@ foreach ($prop in @("Path", "TargetFile", "DirectoryPath", "SearchPath")) {
 
 # 1. File Read / Search tools
 if ($tool -in @("read_file", "view_file", "list_dir", "find_by_name", "grep_search") -and $targetPath) {
+    if (Test-SensitiveDirectory $targetPath) {
+        Stop-WithAlert -Decision "deny" -RuleName "Sensitive-Directory-Access" -TargetInfo $targetPath -Reason "Access blocked to protected system/user directory or drive root: $targetPath"
+    }
+
     if (-not (Test-PathUnder $targetPath $readWritePaths) -and -not (Test-PathUnder $targetPath $readOnlyPaths)) {
         Stop-WithAlert -Decision "deny" -RuleName "Outside-Workspace-Read" -TargetInfo $targetPath -Reason "Read access blocked outside project workspace: $targetPath"
     }
@@ -350,7 +468,14 @@ if ($tool -in @("write_file", "write_to_file", "edit_file", "replace_file_conten
         if (Test-PathUnder $targetPath @($geminiRoot)) {
             Stop-WithAlert -Decision "force_ask" -RuleName "Gemini-Config-Write" -TargetInfo $targetPath -Reason "Agent is attempting to modify .gemini configuration: $targetPath"
         }
+        if (Test-SensitiveDirectory $targetPath) {
+            Stop-WithAlert -Decision "deny" -RuleName "Sensitive-Directory-Access" -TargetInfo $targetPath -Reason "Write blocked to protected system/user directory or drive root: $targetPath"
+        }
         Stop-WithAlert -Decision "deny" -RuleName "Outside-Workspace-Write" -TargetInfo $targetPath -Reason "Write access blocked outside project workspace: $targetPath"
+    }
+
+    if (Test-SensitiveDirectory $targetPath) {
+        Stop-WithAlert -Decision "deny" -RuleName "Sensitive-Directory-Access" -TargetInfo $targetPath -Reason "Write blocked to protected system/user directory or drive root: $targetPath"
     }
 
     if (Test-SecretFile $targetPath) {
@@ -358,7 +483,12 @@ if ($tool -in @("write_file", "write_to_file", "edit_file", "replace_file_conten
     }
 
     if (Test-TrojanWriteTarget $targetPath) {
-        Stop-WithAlert -Decision "force_ask" -RuleName "Agent-Config-Or-Hook-Write" -TargetInfo $targetPath -Reason "Agent is attempting to modify project hooks, agent rules, or IDE auto-run tasks: $targetPath"
+        Stop-WithAlert -Decision "force_ask" -RuleName "Agent-Config-Or-Hook-Write" -TargetInfo $targetPath -Reason "Agent is attempting to modify project hooks, agent configs, or IDE auto-run tasks: $targetPath"
+    }
+
+    $writeContent = if ($args.PSObject.Properties["Content"]) { "$($args.Content)" } elseif ($args.PSObject.Properties["Replacement"]) { "$($args.Replacement)" } else { "" }
+    if (Test-GlobalCustomizationCollision $targetPath $writeContent) {
+        Stop-WithAlert -Decision "force_ask" -RuleName "Global-Customization-Shadowing" -TargetInfo $targetPath -Reason "Project .md file or skill name collides with an existing Global or Built-in customization and would override it: $targetPath"
     }
 
     @{ decision = "allow" } | ConvertTo-Json -Compress
@@ -369,15 +499,23 @@ if ($tool -in @("write_file", "write_to_file", "edit_file", "replace_file_conten
 if ($tool -eq "run_command" -and $args.PSObject.Properties["CommandLine"]) {
     $cmd = "$($args.CommandLine)".Trim('"', "'")
 
+    # 3.0 If no project workspace is selected, Antigravity's terminal CWD defaults to AppData\Local\Programs\antigravity!
+    if (-not $payload.workspacePaths -or @($payload.workspacePaths).Count -eq 0) {
+        Stop-WithAlert -Decision "force_ask" -RuleName "Sensitive-Working-Directory" -TargetInfo $cmd -Reason "No project workspace is open (terminal CWD defaults to AppData\Local\Programs\antigravity inside your user folder)."
+    }
+
     # 3a. Check any explicit drive paths referenced in the command line (skip http:// or https://)
     $driveMatches = [regex]::Matches($cmd, '(?<![A-Za-z0-9_])([A-Za-z]:[/\\][^\s"''`;|&><)*?]*)')
     foreach ($m in $driveMatches) {
         $refPath = $m.Groups[1].Value
-        if (-not (Test-PathUnder $refPath $readWritePaths) -and -not (Test-PathUnder $refPath $readOnlyPaths)) {
-            Stop-WithAlert -Decision "deny" -RuleName "Outside-Workspace-Command" -TargetInfo $cmd -Reason "Command blocked: references path outside project workspace ($refPath)"
-        }
         if (Test-PathUnder $refPath @((Join-Path $geminiRoot "config"))) {
             Stop-WithAlert -Decision "force_ask" -RuleName "Gemini-Config-Command" -TargetInfo $cmd -Reason "Command references .gemini/config ($refPath)"
+        }
+        if (Test-SensitiveDirectory $refPath) {
+            Stop-WithAlert -Decision "deny" -RuleName "Sensitive-Directory-Access" -TargetInfo $cmd -Reason "Command blocked: targets protected system/user directory or drive root ($refPath)"
+        }
+        if (-not (Test-PathUnder $refPath $readWritePaths) -and -not (Test-PathUnder $refPath $readOnlyPaths)) {
+            Stop-WithAlert -Decision "deny" -RuleName "Outside-Workspace-Command" -TargetInfo $cmd -Reason "Command blocked: references path outside project workspace ($refPath)"
         }
     }
 
@@ -402,9 +540,22 @@ if ($tool -eq "run_command" -and $args.PSObject.Properties["CommandLine"]) {
         Stop-WithAlert -Decision "force_ask" -RuleName "Network-File-Upload" -TargetInfo $cmd -Reason "Network command is attempting to upload a local file."
     }
 
-    # 3f. Prompt if shell command modifies .agents or .git/hooks
-    if ($cmd -match '(?i)(^|[\s"''/\\])(\.agents|\.agent|\.git[/\\]hooks|GEMINI\.md|AGENTS\.md)\b') {
-        Stop-WithAlert -Decision "force_ask" -RuleName "Agent-Config-Shell-Touch" -TargetInfo $cmd -Reason "Command references project agent configuration or git hooks."
+    # 3f. Prompt if shell command modifies .agents configs/scripts or .git/hooks (allow .md rule files)
+    if ($cmd -match '(?i)(^|[\s"''/\\])(\.git[/\\]hooks|\.git[/\\]config|\.vscode[/\\](tasks|launch)\.json)\b' -or
+        ($cmd -match '(?i)(^|[\s"''/\\])(\.agents|\.agent|_agents|_agent)\b' -and $cmd -notmatch '(?i)\.md\b')) {
+        Stop-WithAlert -Decision "force_ask" -RuleName "Agent-Config-Shell-Touch" -TargetInfo $cmd -Reason "Command references project agent hooks/configs or git hooks."
+    }
+
+    # 3g. Prompt on destructive file/folder deletion or hard reset commands
+    if ($cmd -match '(?i)(^|[\s;|&\(])(Remove-Item|ri|rm|rmdir|del|erase|rd|Format-Volume|Clear-Content|clc)\b' -or
+        $cmd -match '(?i)\bgit\s+(clean\b|reset\s+--hard\b|checkout\s+--\s+\.)' -or
+        $cmd -match '(?i)\[(System\.)?IO\.(Directory|File|FileInfo|DirectoryInfo)\]::Delete') {
+        Stop-WithAlert -Decision "force_ask" -RuleName "Destructive-Command" -TargetInfo $cmd -Reason "Command performs file/folder deletion or destructive git reset."
+    }
+
+    # 3h. Block system/user PATH or persistent Environment variable tampering
+    if ($cmd -match '(?i)(\$env:(PATH|PATHEXT|PSModulePath)\s*=|\bsetx\b|\bset\s+(PATH|PATHEXT)=|SetEnvironmentVariable|HKCU:\\?Environment|HKLM:\\?SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment)') {
+        Stop-WithAlert -Decision "deny" -RuleName "Environment-Or-Path-Tampering" -TargetInfo $cmd -Reason "Command blocked: attempts to modify PATH or persistent system/user environment variables."
     }
 }
 
