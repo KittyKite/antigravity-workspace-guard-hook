@@ -408,6 +408,16 @@ function Test-SensitiveDirectory([string]$pathStr) {
     return $false
 }
 
+function Test-ReadOnlyInspectionCommand([string]$cmdStr) {
+    if ([string]::IsNullOrWhiteSpace($cmdStr)) { return $false }
+    # Require a single, unchained command (no ;, &, |, >, `, or $() subexpressions)
+    if ($cmdStr -match '[;&|>`]|\$\(') { return $false }
+    if ($cmdStr -match '^(?i)\s*(Get-ChildItem|gci|dir|ls|Get-Item|gi|Get-Content|gc|cat|type|Test-Path|Select-String|sls|Resolve-Path)\b') {
+        return $true
+    }
+    return $false
+}
+
 # Block immediately if the user accidentally opened a sensitive system/user folder or drive root as the workspace
 if ($sensitiveWorkspaces.Count -gt 0) {
     $badWs = $sensitiveWorkspaces -join ", "
@@ -498,21 +508,28 @@ if ($tool -in @("write_file", "write_to_file", "edit_file", "replace_file_conten
 # 3. Terminal commands (run_command)
 if ($tool -eq "run_command" -and $args.PSObject.Properties["CommandLine"]) {
     $cmd = "$($args.CommandLine)".Trim('"', "'")
+    $isReadOnlyCmd = Test-ReadOnlyInspectionCommand $cmd
 
-    # 3.0 If no project workspace is selected, Antigravity's terminal CWD defaults to AppData\Local\Programs\antigravity!
-    if (-not $payload.workspacePaths -or @($payload.workspacePaths).Count -eq 0) {
-        Stop-WithAlert -Decision "force_ask" -RuleName "Sensitive-Working-Directory" -TargetInfo $cmd -Reason "No project workspace is open (terminal CWD defaults to AppData\Local\Programs\antigravity inside your user folder)."
-    }
-
-    # 3a. Check any explicit drive paths referenced in the command line (handles double-quoted, single-quoted, and unquoted paths)
+    # 3a. Extract any explicit drive paths referenced in the command line (handles double-quoted, single-quoted, and unquoted paths)
     $drivePattern = '"([A-Za-z]:[/\\][^"<>|*?\r\n]*)"|''([A-Za-z]:[/\\][^''<>|*?\r\n]*)''|(?<![A-Za-z0-9_"''''])([A-Za-z]:[/\\][^\s"''`;|&><*?)]*)'
     $driveMatches = [regex]::Matches($cmd, $drivePattern)
+
+    # 3.0 If no project workspace is selected, Antigravity's terminal CWD defaults to AppData\Local\Programs\antigravity!
+    # Allow only single read-only inspection commands that target an explicit allowed path (not relative paths in AppData).
+    if (-not $payload.workspacePaths -or @($payload.workspacePaths).Count -eq 0) {
+        if (-not ($isReadOnlyCmd -and $driveMatches.Count -gt 0)) {
+            Stop-WithAlert -Decision "force_ask" -RuleName "Sensitive-Working-Directory" -TargetInfo $cmd -Reason "No project workspace is open (terminal CWD defaults to AppData\Local\Programs\antigravity inside your user folder)."
+        }
+    }
+
     foreach ($m in $driveMatches) {
         $refPath = if ($m.Groups[1].Success) { $m.Groups[1].Value }
                    elseif ($m.Groups[2].Success) { $m.Groups[2].Value }
                    else { $m.Groups[3].Value }
         if (Test-PathUnder $refPath @((Join-Path $geminiRoot "config"))) {
-            Stop-WithAlert -Decision "force_ask" -RuleName "Gemini-Config-Command" -TargetInfo $cmd -Reason "Command references .gemini/config ($refPath)"
+            if (-not $isReadOnlyCmd) {
+                Stop-WithAlert -Decision "force_ask" -RuleName "Gemini-Config-Command" -TargetInfo $cmd -Reason "Command attempts non-read-only operation in .gemini/config ($refPath)"
+            }
         }
         if (Test-SensitiveDirectory $refPath) {
             Stop-WithAlert -Decision "deny" -RuleName "Sensitive-Directory-Access" -TargetInfo $cmd -Reason "Command blocked: targets protected system/user directory or drive root ($refPath)"
