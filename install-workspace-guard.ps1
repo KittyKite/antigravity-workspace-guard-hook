@@ -1,12 +1,16 @@
-# Self-contained installer for the Antigravity Global Workspace Guard Hook (Hardened + PostToolUse/PreInvocation Runtime Stdout Scanner)
+﻿# Self-contained installer for the Antigravity Global Workspace Guard Hook (Hardened + PostToolUse/PreInvocation Runtime Stdout Scanner)
 # Run this script in PowerShell on any Windows computer to install the hook globally.
 
-$configDir  = Join-Path $env:USERPROFILE ".gemini\config"
-$scriptsDir = Join-Path $configDir "scripts"
-$hooksFile  = Join-Path $configDir "hooks.json"
-$guardFile  = Join-Path $scriptsDir "workspace-guard.ps1"
+$configDir          = Join-Path $env:USERPROFILE ".gemini\config"
+$scriptsDir         = Join-Path $configDir "scripts"
+$hooksFile          = Join-Path $configDir "hooks.json"
+$guardFile          = Join-Path $scriptsDir "workspace-guard.ps1"
+$guardPluginDir     = Join-Path $configDir "plugins\workspace-guard-rules"
+$guardPluginRules   = Join-Path $guardPluginDir "rules"
+$guardPluginJson    = Join-Path $guardPluginDir "plugin.json"
+$guardPluginAgents  = Join-Path $guardPluginRules "AGENTS.md"
 
-New-Item -ItemType Directory -Force -Path $scriptsDir | Out-Null
+New-Item -ItemType Directory -Force -Path $scriptsDir, $guardPluginRules | Out-Null
 
 $hooksJson = @'
 {
@@ -350,7 +354,8 @@ function Test-GlobalCustomizationCollision([string]$pathStr, [string]$newContent
     $protectedNames = @(
         "agy-customizations", "antigravity-guide", "antigravity_guide", "automation",
         "generative_ui", "migrate-agent-settings", "migrate-workflows", "plugin",
-        "swarm", "native_swarm", "swarm_monitor", "ui-plugin-navigation"
+        "swarm", "native_swarm", "swarm_monitor", "ui-plugin-navigation",
+        "workspace-guard-rules"
     )
     foreach ($skillRoot in @((Join-Path $geminiRoot "config\skills"), (Join-Path $geminiRoot "antigravity\builtin\skills"))) {
         if (Test-Path -LiteralPath $skillRoot) {
@@ -583,9 +588,47 @@ if ($tool -eq "run_command" -and $args.PSObject.Properties["CommandLine"]) {
 @{ decision = "allow" } | ConvertTo-Json -Compress
 '@
 
-# IMPORTANT: Write UTF-8 WITHOUT BOM so Antigravity's JSON parser accepts hooks.json!
+$pluginManifestJson = @'
+{
+  "name": "workspace-guard-rules",
+  "description": "Global rules informing all agents of the active Antigravity Workspace Guard security hook boundaries."
+}
+'@
+
+$agentRulesMarkdown = @'
+# Antigravity Workspace Guard — Security Hook Boundaries
+
+A global lifecycle hook (`~/.gemini/config/hooks.json` -> `scripts/workspace-guard.ps1`) enforces deterministic read, write, and command boundaries on all tool calls. Blocked or flagged attempts trigger visible desktop alerts and are logged to `~/.gemini/security-alerts.log`.
+
+## 1. Allowed Without Prompting (`allow`)
+- **Active Project Workspace (`workspacePaths`)**: Read, search, create, and edit project source code, tests, and documentation inside the open project folder(s), plus this conversation's artifact directory and `~/.gemini/antigravity/scratch`.
+- **Project-Local Markdown Rules & Skills**: Create or edit `GEMINI.md`, `AGENTS.md`, or `*.md` files under `.agents/` (e.g., `.agents/rules/*.md`, `.agents/skills/*/SKILL.md`) **as long as** their filename, skill folder name, or YAML `name:` does not collide with an existing global or built-in customization.
+- **Read-Only `.gemini` Inspection**: Read `~/.gemini/antigravity/builtin`, `~/.gemini/antigravity/plugins`, `~/.gemini/config`, and the current conversation transcript via `read_file` or a single, unchained read-only shell command (`Get-ChildItem`, `dir`, `ls`, `Get-Content`, `Test-Path`, `Select-String`, `Resolve-Path` with no `;`, `&`, `|`, `>`, backticks, or `$()`).
+- **Normal Dev & Web Lookups**: Run build/test/git commands inside an open workspace and perform outbound `GET` lookups (`curl`, `Invoke-WebRequest`, `search_web`).
+
+## 2. Hard Blocked (`deny` — Never Attempt or Work Around)
+- **Outside-Workspace & Sensitive Directories**: Reading, writing, or targeting paths outside the active project workspace—or targeting drive roots (`C:\`, `D:\`), `Windows`, `Program Files` (including `Progra~1`/`Progra~2`), `ProgramData`, `C:\Users`, `C:\Users\<any_user>`, `AppData`, `Desktop`, `Documents`, `Downloads`, `.ssh`, `.aws`, `.azure`, `.kube`, `.gnupg`, `.docker`, `.config`, or `.gemini` (outside the read-only/artifact/scratch paths above).
+- **Sensitive Workspace Root**: Opening any protected system folder, user folder, or drive root as the active workspace blocks tool calls immediately.
+- **Traversal & Obfuscation**: Relative parent traversal (`..\`), home shortcuts (`~`, `$HOME`, `$env:USERPROFILE`, `%USERPROFILE%`), PowerShell `-EncodedCommand`/`-enc`, `FromBase64String`, `Invoke-Expression`/`iex`, and environment variable dumps (`Get-ChildItem Env:`, `GetEnvironmentVariables`).
+- **`PATH` & Environment Tampering**: Modifying `$env:PATH`, `$env:PATHEXT`, `$env:PSModulePath`, `setx`, `set PATH=`, `SetEnvironmentVariable`, or registry Environment keys.
+
+## 3. Requires Explicit User Confirmation (`force_ask`)
+- **Secrets & Credentials**: Reading, writing, or touching `.env*` (except `.env.example`, `.sample`, `.template`, `.defaults`), `*.pem`, `*.key`, `*.pfx`, `*.p12`, `id_rsa*`, `id_ed25519*`, `.npmrc`, `.pypirc`, or `credentials.json`.
+- **Agent / IDE / Git Configs & Global Collisions**: Writing `~/.gemini/` configs, `.agents/` non-Markdown files (`hooks.json`, `mcp_config.json`, `plugins.json`, `skills.json`, scripts), `.git/hooks`, `.git/config`, `.vscode/tasks.json`, `.vscode/launch.json`, or project `.md` rules/skills that shadow a global or built-in name.
+- **Destructive Commands**: `Remove-Item`, `ri`, `rm`, `rmdir`, `del`, `erase`, `rd`, `Format-Volume`, `Clear-Content`, `clc`, `git clean`, `git reset --hard`, `git checkout -- .`, or `[IO.Directory]::Delete` / `[IO.File]::Delete`.
+- **Local File Uploads & No-Workspace Shell**: Uploading local files via `curl`/`Invoke-WebRequest` (`-F`, `-d @`, `--data-binary @`, `--upload-file`, `-InFile`), or running `run_command` when no project workspace is open (except single, unchained read-only commands on explicit allowed paths).
+- **Prompt-Injection Scanners**: Files or runtime `stdout` containing invisible Unicode bidi/tag characters or prompt-injection boundary markers trigger alerts and neutralization warnings.
+
+## 4. Required Agent Conduct
+- **Do not** attempt to bypass a `deny` or `force_ask` block using alternate tools, string splitting/concatenation, encoding, helper scripts, or indirect paths.
+- When a task requires files outside the active workspace or modifying protected configs/secrets, **stop and ask the user** to move/copy the files into the project or grant permission explicitly.
+'@
+
+# IMPORTANT: Write UTF-8 WITHOUT BOM so Antigravity's JSON parser accepts hooks.json and plugin.json!
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText($hooksFile, $hooksJson, $utf8NoBom)
 [System.IO.File]::WriteAllText($guardFile, $guardScript, $utf8NoBom)
+[System.IO.File]::WriteAllText($guardPluginJson, $pluginManifestJson, $utf8NoBom)
+[System.IO.File]::WriteAllText($guardPluginAgents, $agentRulesMarkdown, $utf8NoBom)
 
-Write-Host "Installed Hardened Antigravity Workspace Guard Hook (PreToolUse + PostToolUse + PreInvocation) to: $configDir" -ForegroundColor Green
+Write-Host "Installed Hardened Antigravity Workspace Guard Hook + Global Agent Rules Plugin to: $configDir" -ForegroundColor Green
