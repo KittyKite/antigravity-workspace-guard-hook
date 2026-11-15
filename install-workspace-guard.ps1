@@ -31,7 +31,7 @@ $hooksJson = @'
     ],
     "PostToolUse": [
       {
-        "matcher": "run_command|grep_search|search_web|.*mcp.*",
+        "matcher": "run_command|grep_search|search_web|list_dir|find_by_name|.*mcp.*",
         "hooks": [
           {
             "type": "command",
@@ -176,6 +176,8 @@ try {
 $tool = if ($payload.PSObject.Properties["toolCall"] -and $payload.toolCall) { "$($payload.toolCall.name)".ToLowerInvariant() } else { "runtime_output" }
 $args = if ($payload.PSObject.Properties["toolCall"] -and $payload.toolCall) { $payload.toolCall.args } else { $null }
 
+$script:PiTagRegex = '(</' + 'USER_REQUEST>|<SYSTEM_' + 'MESSAGE>|IGNORE ALL PREVIOUS ' + 'INSTRUCTIONS|DISREGARD ALL PREVIOUS ' + 'INSTRUCTIONS)'
+
 # =========================================================================================
 # POST-TOOL-USE & PRE-INVOCATION: Scan Runtime Output (stdout / search / MCP) for Injection
 # =========================================================================================
@@ -184,7 +186,7 @@ function Test-TextForPromptInjection([string]$textToScan) {
     if ($textToScan -match '[\u202A-\u202E\u2066-\u2069]|\uDB40[\uDC00-\uDC7F]') {
         return @{ Rule = "Runtime-Stdout-Unicode-Injection"; Reason = "Tool output contains invisible Unicode tag/override characters!" }
     }
-    if ($textToScan -match '(</USER_REQUEST>|<SYSTEM_MESSAGE>|IGNORE ALL PREVIOUS INSTRUCTIONS|DISREGARD ALL PREVIOUS INSTRUCTIONS)') {
+    if ($textToScan -match $script:PiTagRegex) {
         return @{ Rule = "Runtime-Stdout-Prompt-Injection"; Reason = "Tool output contains prompt injection boundary markers!" }
     }
     return $null
@@ -198,7 +200,7 @@ if ($HookEvent -eq "PostToolUse" -or $HookEvent -eq "PreInvocation") {
             $tFile = if (Test-Path -LiteralPath $tFull) { $tFull } elseif (Test-Path -LiteralPath "$($payload.transcriptPath)") { "$($payload.transcriptPath)" } else { $null }
 
             if ($tFile) {
-                $recentLines = @(Get-Content -LiteralPath $tFile -Tail 12 -ErrorAction SilentlyContinue)
+                $recentLines = @(Get-Content -LiteralPath $tFile -Tail 40 -ErrorAction SilentlyContinue)
                 $stepsAfterBoundary = @()
                 for ($i = $recentLines.Count - 1; $i -ge 0; $i--) {
                     $line = $recentLines[$i]
@@ -262,10 +264,10 @@ if ($HookEvent -eq "PostToolUse" -or $HookEvent -eq "PreInvocation") {
 function Resolve-CanonicalPath([string]$pathStr) {
     if ([string]::IsNullOrWhiteSpace($pathStr)) { return $null }
     try {
-        $clean = $pathStr.Trim('"', "'", ' ')
+        $clean = $pathStr.Trim('"', "'", ' ') -replace '^(?i)(?:Microsoft\.PowerShell\.Core\\)?FileSystem::', ''
         $full  = [System.IO.Path]::GetFullPath($clean).TrimEnd('\', '/')
 
-        # Walk up to deepest existing path component and resolve NTFS symlinks/junctions
+        # Walk all path components up to drive root and resolve any NTFS symlinks/junctions
         $probe = $full
         $suffixParts = @()
         $hops = 0
@@ -279,8 +281,9 @@ function Resolve-CanonicalPath([string]$pathStr) {
                     }
                     $rebuilt = $linkTarget
                     if ($suffixParts.Count -gt 0) {
-                        [array]::Reverse($suffixParts)
-                        $rebuilt = Join-Path $rebuilt ($suffixParts -join '\')
+                        $revSuffix = @($suffixParts)
+                        [array]::Reverse($revSuffix)
+                        $rebuilt = Join-Path $rebuilt ($revSuffix -join '\')
                     }
                     $full = [System.IO.Path]::GetFullPath($rebuilt).TrimEnd('\', '/')
                     $probe = $full
@@ -288,7 +291,6 @@ function Resolve-CanonicalPath([string]$pathStr) {
                     $hops++
                     continue
                 }
-                break
             }
             $parent = Split-Path $probe -Parent
             $leaf   = Split-Path $probe -Leaf
@@ -349,8 +351,9 @@ function Test-SensitiveDirectory([string]$pathStr, [string[]]$exemptRoots = @())
 
 function Test-SecretFile([string]$pathStr) {
     if ([string]::IsNullOrWhiteSpace($pathStr)) { return $false }
-    $leaf = [System.IO.Path]::GetFileName($pathStr.Trim('"', "'", ' '))
-    if ($leaf -match '^(?i)(\.env(\..+)?|.*\.(pem|key|pfx|p12)|id_rsa.*|id_ed25519.*|\.npmrc|\.pypirc|credentials\.json)$') {
+    $norm = $pathStr.Trim('"', "'", ' ').Replace('/', '\')
+    $leaf = ($norm -split '\\')[-1]
+    if ($leaf -match '^(?i)(\.env(\*.*|\..+)?|.*\.(pem|key|pfx|p12)|id_rsa.*|id_ed25519.*|\.npmrc|\.pypirc|credentials(\.json|[*?].*))$') {
         if ($leaf -match '^(?i)\.env\.(example|sample|template|defaults)$') { return $false }
         return $true
     }
@@ -471,7 +474,7 @@ function Test-GlobalCustomizationCollision([string]$pathStr, [string]$newContent
     }
 
     if (-not [string]::IsNullOrWhiteSpace($newContent)) {
-        $nameMatches = [regex]::Matches($newContent, '(?m)^name:\s*[''"]?([A-Za-z0-9_-]+)[''"]?\s*$')
+        $nameMatches = [regex]::Matches($newContent, '(?m)^name:\s*[''"]?([A-Za-z0-9_-]+)[''"]?(?:\s*#.*)?\s*$')
         foreach ($nm in $nameMatches) {
             if ($nm.Groups[1].Value.ToLowerInvariant() -in $protectedNames) { return $true }
         }
@@ -519,7 +522,7 @@ function Invoke-PreReadPromptInjectionScan([string]$filePath) {
         if ($rawText -match '[\u202A-\u202E\u2066-\u2069]|\uDB40[\uDC00-\uDC7F]') {
             Stop-WithAlert -Decision "force_ask" -RuleName "Unicode-Prompt-Injection" -TargetInfo $filePath -Reason "Suspicious invisible Unicode tag/override characters detected in file: $filePath"
         }
-        if ($rawText -match '(</USER_REQUEST>|<SYSTEM_MESSAGE>|IGNORE ALL PREVIOUS INSTRUCTIONS|DISREGARD ALL PREVIOUS INSTRUCTIONS)') {
+        if ($rawText -match $script:PiTagRegex) {
             Stop-WithAlert -Decision "force_ask" -RuleName "Prompt-Injection-Signature" -TargetInfo $filePath -Reason "Suspicious prompt injection boundary markers detected in file: $filePath"
         }
     } catch {
@@ -575,22 +578,23 @@ function Invoke-CommandSafetyCheck {
         [bool]$CheckNoWorkspaceCwd = $true
     )
     $cmd = $CmdText.Trim('"', "'")
+    $cmdScan = $cmd -replace '(?i)(?:Microsoft\.PowerShell\.Core\\)?FileSystem::', ''
     $isReadOnlyCmd = Test-ReadOnlyInspectionCommand $cmd
 
     # Extract explicit drive paths (quoted or unquoted)
     $drivePattern = '"([A-Za-z]:[/\\][^"<>|*?\r\n]*)"|''([A-Za-z]:[/\\][^''<>|*?\r\n]*)''|(?<![A-Za-z0-9_"''''])([A-Za-z]:[/\\][^\s"''`;|&><*?)]*)'
-    $driveMatches = [regex]::Matches($cmd, $drivePattern)
+    $driveMatches = [regex]::Matches($cmdScan, $drivePattern)
 
-    # Check UNC paths (\\server\share, \\localhost\c$\..., //server/share)
-    $uncPattern = '"((?:\\\\|//)[^"<>|*?\r\n]+)"|''((?:\\\\|//)[^''<>|*?\r\n]+)''|(?<![A-Za-z0-9_:/\\])((?:\\\\|//)[^\s"''`;|&><*?)]+)'
-    $uncMatches = [regex]::Matches($cmd, $uncPattern)
+    # Check UNC paths (\\server\share, \\localhost\c$\..., //server/share; avoid false positive on quoted "// comment")
+    $uncPattern = '"(\\\\[^"<>|*?\r\n]+|//[^\s/\\<>|*?:"'']+[/\\][^\s<>|*?"]+)"|''(\\\\[^''<>|*?\r\n]+|//[^\s/\\<>|*?:"'']+[/\\][^\s<>|*?'''']+)''|(?<![A-Za-z0-9_:/\\])(\\\\[^\s"''`;|&><*?)]+|//[^\s/\\<>|*?:"'']+[/\\][^\s"''`;|&><*?)]+)'
+    $uncMatches = [regex]::Matches($cmdScan, $uncPattern)
     foreach ($um in $uncMatches) {
         $uncPath = if ($um.Groups[1].Success) { $um.Groups[1].Value } elseif ($um.Groups[2].Success) { $um.Groups[2].Value } else { $um.Groups[3].Value }
         Stop-WithAlert -Decision "deny" -RuleName "Outside-Workspace-Command" -TargetInfo $cmd -Reason "Command blocked: references UNC/network path outside project workspace ($uncPath)"
     }
 
     # Check drive-root-relative paths (\Windows\..., \Users\..., \Program Files\...)
-    $rootRelMatches = [regex]::Matches($cmd, '(?i)(?<![A-Za-z0-9_:/\\])(\\(?:Windows|WINDOW~[1-4]|Users|Program Files|ProgramData|Progra~[1-4]|AppData|Recovery|\$Recycle\.Bin|boot|efi)(?:\\[^\s"''`;|&><*?)]*)?)')
+    $rootRelMatches = [regex]::Matches($cmdScan, '(?i)(?<![A-Za-z0-9_:/\\])(\\(?:Windows|WINDOW~[1-4]|Users|Program Files|ProgramData|Progra~[1-4]|AppData|Recovery|\$Recycle\.Bin|boot|efi)(?:\\[^\s"''`;|&><*?)]*)?)')
     foreach ($rm in $rootRelMatches) {
         $rootRel = $rm.Groups[1].Value
         Stop-WithAlert -Decision "deny" -RuleName "Sensitive-Directory-Access" -TargetInfo $cmd -Reason "Command blocked: references drive-root-relative sensitive path ($rootRel)"
@@ -633,11 +637,11 @@ function Invoke-CommandSafetyCheck {
         }
     }
 
-    # 3b. Block traversal (.. / ~ standalone or with slash) and sensitive Windows env vars / brace syntax
+    # 3b. Block traversal (.. / ~ standalone or with slash), $PROFILE/$PSHOME/GetTempPath, and sensitive env vars
     if ($cmd -match '(^|[\s"''=/\\(;])\.\.($|[\s"''/\\);])' -or
         $cmd -match '(^|[\s"''=(;])~($|[\s"''/\\);])' -or
-        $cmd -match '(?i)(\$HOME\b|\$\{?env:(USERPROFILE|APPDATA|LOCALAPPDATA|TEMP|TMP|WINDIR|SystemRoot|ProgramFiles|ProgramFiles\(x86\)|ProgramData|OneDrive|HOMEDRIVE|HOMEPATH)\}?|%(USERPROFILE|APPDATA|LOCALAPPDATA|TEMP|TMP|WINDIR|SystemRoot|ProgramFiles|ProgramData|OneDrive|HOMEDRIVE|HOMEPATH)%|\[(?:System\.)?Environment\]::GetFolderPath)') {
-        Stop-WithAlert -Decision "deny" -RuleName "Directory-Traversal-Command" -TargetInfo $cmd -Reason "Command blocked: references parent directory (..), home (~), or sensitive Windows user/system environment variables."
+        $cmd -match '(?i)(\$HOME\b|\$PROFILE\b|\$PSHOME\b|\$\{?env:(USERPROFILE|APPDATA|LOCALAPPDATA|TEMP|TMP|WINDIR|SystemRoot|ProgramFiles|ProgramFiles\(x86\)|ProgramData|OneDrive|HOMEDRIVE|HOMEPATH)\}?|%(USERPROFILE|APPDATA|LOCALAPPDATA|TEMP|TMP|WINDIR|SystemRoot|ProgramFiles|ProgramData|OneDrive|HOMEDRIVE|HOMEPATH)%|\[(?:System\.)?Environment\]::GetFolderPath|\[(?:System\.)?IO\.Path\]::GetTempPath\s*\()') {
+        Stop-WithAlert -Decision "deny" -RuleName "Directory-Traversal-Command" -TargetInfo $cmd -Reason 'Command blocked: references parent directory (..), home (~), $PROFILE/$PSHOME, GetTempPath, or sensitive Windows environment variables.'
     }
 
     # 3c. Block obfuscated PowerShell (all -EncodedCommand prefixes), Invoke-Expression, and env dumps
@@ -645,30 +649,31 @@ function Invoke-CommandSafetyCheck {
         ($cmd -match '(?i)(?:^|\s)-en|\b(?:powershell|pwsh)(?:\.exe)?\b')) {
         Stop-WithAlert -Decision "deny" -RuleName "Obfuscation-Or-Env-Dump" -TargetInfo $cmd -Reason "Command blocked: uses PowerShell -EncodedCommand (or shortened prefix)."
     }
-    if ($cmd -match '(?i)(FromBase64String|Invoke-Expression\b|\biex\b|\bcmd(?:\.exe)?\s+/c\s+set\b|(?:Get-ChildItem|gci|dir|ls|Get-Item|gi)\b[^\r\n;|&]*\bEnv:|\[(?:System\.)?Environment\]::GetEnvironmentVariable(?:s)?\s*\()') {
-        Stop-WithAlert -Decision "deny" -RuleName "Obfuscation-Or-Env-Dump" -TargetInfo $cmd -Reason "Command blocked: uses Base64 obfuscation, Invoke-Expression, or dumps environment variables."
+    if ($cmd -match '(?i)(FromBase64String|Invoke-Expression\b|\biex\b|\bcmd(?:\.exe)?\s+/[ck]\s+["'']?set\b|(?:Get-ChildItem|gci|dir|ls|Get-Item|gi|Get-Content|gc|cat|type|Select-String|sls)\b[^\r\n;|&]*\bEnv:|\[(?:System\.)?Environment\]::GetEnvironmentVariable(?:s)?\s*\()') {
+        Stop-WithAlert -Decision "deny" -RuleName "Obfuscation-Or-Env-Dump" -TargetInfo $cmd -Reason "Command blocked: uses Base64 obfuscation, Invoke-Expression, or reads/dumps environment variables via Env:."
     }
 
-    # 3d. Block reading/writing secret files via shell (matches Test-SecretFile coverage)
-    $secretTokenMatches = [regex]::Matches($cmd, '(?i)(?:^|[\s"''/\\=])([^\s"''`;|&><)*?]*?(?:\.env(?:\.[^\s"''`;|&><)*?]+)?|id_rsa[^\s"''`;|&><)*?]*|id_ed25519[^\s"''`;|&><)*?]*|\.npmrc|\.pypirc|credentials\.json|[^\s"''`;|&><)*?/\\]+\.(?:pem|key|pfx|p12)))(?=$|[\s"''`;|&><)*?])')
+    # 3d. Block reading/writing secret files via shell (including wildcards like *.pem, .env*, credentials*)
+    $secretTokenMatches = [regex]::Matches($cmd, '(?i)(?:^|[\s"''/\\=])([^\s"''`;|&><)]*?(?:\.env(?:[.*][^\s"''`;|&><)]*)?|id_rsa[^\s"''`;|&><)]*|id_ed25519[^\s"''`;|&><)]*|\.npmrc|\.pypirc|credentials(?:\.json|[*?][^\s"''`;|&><)]*)|[^\s"''`;|&><)/\\]+\.(?:pem|key|pfx|p12)))(?=$|[\s"''`;|&><)])')
     foreach ($sm in $secretTokenMatches) {
         if (Test-SecretFile $sm.Groups[1].Value) {
             Stop-WithAlert -Decision "force_ask" -RuleName "Secret-File-Shell-Access" -TargetInfo $cmd -Reason "Command references a sensitive secret/credential file ($($sm.Groups[1].Value))."
         }
     }
 
-    # 3e. Allow normal GET lookups, prompt on file upload or .NET exfil classes / scp / sftp
+    # 3e. Allow normal GET lookups, prompt on file upload or .NET exfil classes / BITS / scp / sftp
     if (($cmd -match '(?i)\b(curl|curl\.exe|Invoke-WebRequest|Invoke-RestMethod|iwr|irm)\b' -and
-         $cmd -match '(?i)(--data(?:-[a-z-]+)?\s*@|-d\s*@|-F\b|--form\b|--upload-file\b|-T\b|-InFile\b|-Body\b)') -or
-        $cmd -match '(?i)\[(?:System\.)?Net\.WebClient\]|\[(?:System\.)?Net\.Http\.HttpClient\]|\b(?:scp|sftp)(?:\.exe)?\b') {
+         ($cmd -match '(?i)(--data(?:-[a-z-]+)?(?:\s+|=)@|-d(?:\s+|=)?@|--form\b|--upload-file\b|-InFile\b|-Body\b)' -or
+          $cmd -cmatch '(?:^|\s)-[FT](?:\s+\S|\S+)')) -or
+        $cmd -match '(?i)\[(?:System\.)?Net\.WebClient\]|\[(?:System\.)?Net\.Http\.HttpClient\]|\[(?:System\.)?Net\.Sockets\.TcpClient\]|\b(?:Start-BitsTransfer|scp|sftp)(?:\.exe)?\b') {
         Stop-WithAlert -Decision "force_ask" -RuleName "Network-File-Upload" -TargetInfo $cmd -Reason "Network command is attempting to upload a local file or use raw transfer clients."
     }
 
     # 3f. Prompt if shell command touches .git/hooks, .git/config, .vscode tasks/launch, or non-.md paths under .agents/
-    if ($cmd -match '(?i)(^|[\s"''/\\])(\.git[/\\]hooks|\.git[/\\]config|\.vscode[/\\](tasks|launch)\.json)\b') {
+    if ($cmd -match '(?i)(^|[\s"''/\\(;])(\.git[/\\]hooks|\.git[/\\]config|\.vscode[/\\](tasks|launch)\.json)\b') {
         Stop-WithAlert -Decision "force_ask" -RuleName "Agent-Config-Shell-Touch" -TargetInfo $cmd -Reason "Command references git hooks/config or VS Code task/launch configuration."
     }
-    $agentTokens = [regex]::Matches($cmd, '(?i)(?:^|[\s"''=])([^\s"''`;|&><)*?]*?(?:\.agents|\.agent|_agents|_agent)(?:[/\\][^\s"''`;|&><)*?]*)?)')
+    $agentTokens = [regex]::Matches($cmd, '(?i)(?:^|[\s"''=(,;])([^\s"''`;|&><)]*?(?:\.agents|\.agent|_agents|_agent)(?:[/\\][^\s"''`;|&><)]*)?)')
     foreach ($at in $agentTokens) {
         $tok = $at.Groups[1].Value.Trim('"', "'")
         if ($tok -notmatch '(?i)\.md$') {
@@ -676,16 +681,23 @@ function Invoke-CommandSafetyCheck {
         }
     }
 
-    # 3g. Prompt on destructive file/folder deletion, overwrite cmdlets, moves, or destructive git ops
-    if ($cmd -match '(?i)(^|[\s;|&\(])(?:["'']?(?:Microsoft\.PowerShell\.Management\\)?(?:Remove-Item|ri|rm|rmdir|del|erase|rd|Format-Volume|Clear-Content|clc|Set-Content|sc|Out-File|Move-Item|mv|mi)["'']?)\b' -or
-        $cmd -match '(?i)\bgit\s+(?:clean\b|reset\s+--hard\b|checkout\s+--\s+\.|push\s+(?:-f\b|--force(?:-[a-z-]+)?\b)|restore\s+\.|branch\s+-D\b)' -or
+    # 3g. Prompt on destructive file/folder deletion, overwrite cmdlets/redirections, moves/renames, or destructive git ops
+    if ($cmd -match '(?i)(^|[\s;|&\(])(?:["'']?(?:Microsoft\.PowerShell\.Management\\)?(?:Remove-Item|ri|rm|rmdir|del|erase|rd|Format-Volume|Clear-Content|clc|Set-Content|sc|Out-File|Move-Item|mv|mi|Rename-Item|rni|ren)["'']?)\b' -or
+        $cmd -match '(?i)\b(?:Copy-Item|cp|cpi|copy)\b[^\r\n;|&]*\s-Force\b' -or
+        $cmd -match '(?i)\bgit\s+(?:clean\b|reset\s+--hard\b|checkout\s+--\s+\.|push\s+(?:-f\b|--force(?:-[a-z-]+)?\b)|restore\b(?!\s+--staged\b)|branch\s+-D\b)' -or
+        $cmd -match '(?<![=-])>>?\s*(?!(?:\$null\b|&\d+|&))[^\s;|&]+' -or
         $cmd -match '(?i)\[(?:System\.)?IO\.(?:Directory|File|FileInfo|DirectoryInfo)\]::Delete') {
-        Stop-WithAlert -Decision "force_ask" -RuleName "Destructive-Command" -TargetInfo $cmd -Reason "Command performs file/folder deletion, move/overwrite, or destructive git operation."
+        Stop-WithAlert -Decision "force_ask" -RuleName "Destructive-Command" -TargetInfo $cmd -Reason "Command performs file/folder deletion, move/rename/overwrite, redirection, or destructive git operation."
     }
 
     # 3h. Block system/user PATH or persistent Environment variable tampering (including += and ${env:...})
     if ($cmd -match '(?i)(\$\{?env:(PATH|PATHEXT|PSModulePath)\}?\s*\+?=|\bsetx\b|\bset\s+(PATH|PATHEXT)=|SetEnvironmentVariable|HKCU:\\?Environment|HKLM:\\?SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment)') {
         Stop-WithAlert -Decision "deny" -RuleName "Environment-Or-Path-Tampering" -TargetInfo $cmd -Reason "Command blocked: attempts to modify PATH or persistent system/user environment variables."
+    }
+
+    # 3i. Prompt when reading arbitrary environment variables ($env:SECRET / ${env:SECRET}) in shell commands
+    if ($cmd -match '(?i)(?:\$env:[A-Za-z0-9_]+\b|\$\{env:[A-Za-z0-9_]+\})(?!\s*[+]?=)') {
+        Stop-WithAlert -Decision "force_ask" -RuleName "Environment-Variable-Read" -TargetInfo $cmd -Reason 'Command reads environment variable value(s) via $env: which may expose secrets.'
     }
 }
 
